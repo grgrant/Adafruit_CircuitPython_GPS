@@ -89,6 +89,22 @@ _SENTENCE_PARAMS = (
 # Internal helper parsing functions.
 # These handle input that might be none or null and return none instead of
 # throwing errors.
+def _split_decimal(nmea_data: str) -> Tuple[Optional[str], str]:
+    # Split a numeric NMEA field into its integer and fractional digits.
+    # Returns (None, "") if either part is missing or non-numeric. The
+    # fractional part is optional; some receivers omit it entirely.
+    dot = nmea_data.find(".")
+    if dot == -1:
+        int_part, minutes_decimal = nmea_data, "0"
+    else:
+        int_part, minutes_decimal = nmea_data[:dot], nmea_data[dot + 1 :]
+        if not minutes_decimal:
+            minutes_decimal = "0"
+    if not int_part.isdigit() or not minutes_decimal.isdigit():
+        return None, ""
+    return int_part, minutes_decimal
+
+
 def _parse_degrees(nmea_data: str) -> int:
     # Parse a NMEA lat/long data pair 'dddmm.mmmm' into a pure degrees value.
     # Where ddd is the degrees, mm.mmmm is the minutes.
@@ -97,10 +113,12 @@ def _parse_degrees(nmea_data: str) -> int:
     # To avoid losing precision handle degrees and minutes separately
     # Return the final value as an integer. Further functions can parse
     # this into a float or separate parts to retain the precision
-    raw = nmea_data.split(".")
-    degrees = int(raw[0]) // 100 * 1000000  # the ddd
-    minutes = int(raw[0]) % 100  # the mm.
-    minutes += int(f"{raw[1][:4]:0<4}") / 10000
+    int_part, minutes_decimal = _split_decimal(nmea_data)
+    if int_part is None:
+        return None
+    degrees = int(int_part) // 100 * 1000000  # the ddd
+    minutes = int(int_part) % 100  # the mm.
+    minutes += int(f"{minutes_decimal[:4]:0<4}") / 10000
     minutes = int((minutes * 1000000) / 60)
     return degrees + minutes
 
@@ -125,6 +143,8 @@ def _parse_str(nmea_data: str) -> str:
 
 def _read_degrees(data: List[float], index: int, neg: str) -> float:
     # This function loses precision with float32
+    if data[index] is None or data[index + 1] is None:
+        return None
     x = data[index] / 1000000
     if data[index + 1].lower() == neg:
         x *= -1.0
@@ -136,12 +156,14 @@ def _read_deg_mins(data: List[str], index: int, neg: str) -> Tuple[int, float]:
     # longitudes, which makes parsing tricky:
     # for latitudes: ddmm,mmmm (0 - 7 decimal places, not zero padded)
     # for longitudes: dddmm,mmmm (0 - 7 decimal places, not zero padded)
-    if "." in data[index]:
-        int_part, minutes_decimal = data[index].split(".")
-    else:
-        int_part, minutes_decimal = data[index], 0
+    if data[index] is None or len(data[index]) < 3:
+        return None, None
 
     # we need to parse from right to left, minutes can only have 2 digits
+    int_part, minutes_decimal = _split_decimal(data[index])
+    if int_part is None or len(int_part) < 3:
+        return None, None
+
     minutes_int = int_part[-2:]
     # the rest must be degrees which are either 2 or 3 digits
     deg = int(int_part[:-2])
