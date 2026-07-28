@@ -183,7 +183,8 @@ def _parse_talker(data_type: bytes) -> Tuple[bytes, bytes]:
     return (data_type[:2], data_type[2:])
 
 
-def _parse_data(sentence_type: int, data: List[str]) -> Optional[List]:
+def _parse_data(sentence_type: int, data: List[str]) -> Optional[List]:  # noqa: PLR0911
+    # PLR0911: each early return is a distinct, self-documenting rejection reason ...
     """Parse sentence data for the specified sentence type and
     return a list of parameters in the correct format, or return None.
     """
@@ -218,8 +219,14 @@ def _parse_data(sentence_type: int, data: List[str]) -> Optional[List]:
                 else:
                     params.append(dti)
             elif pti == "d":
-                # A number parseable as degrees
-                params.append(_parse_degrees(dti))
+                # A number parseable as degrees.
+                # Required field so unparseable or empty should reject whole sentence.
+                if nothing:
+                    return None
+                parsed_degrees = _parse_degrees(dti)
+                if parsed_degrees is None:
+                    return None
+                params.append(parsed_degrees)
             elif pti == "D":
                 # A number parseable as degrees or Nothing
                 if nothing:
