@@ -807,6 +807,13 @@ class GPS:
         return True
 
 
+_GPSI2C_MAX_PENDING = const(128)  # NMEA sentences are <= 82 bytes; an unterminated
+# buffer past this means a terminator was lost, so
+# resync rather than growing without bound (issue #123).
+_GPSI2C_MIN_PACKET = const(11)  # smallest viable sentence; matches the gate in
+# _read_sentence() before it attempts a readline().
+
+
 class GPS_GtopI2C(GPS):
     """GTop-compatible I2C GPS parsing module.  Can parse simple NMEA data
     sentences from an I2C-capable GPS module to read latitude, longitude, and more.
@@ -819,31 +826,70 @@ class GPS_GtopI2C(GPS):
         address: int = _GPSI2C_DEFAULT_ADDRESS,
         debug: bool = False,
         timeout: float = 5.0,
+        chunk_size: int = 32,
     ) -> None:
         from adafruit_bus_device import i2c_device  # noqa: PLC0415
 
         super().__init__(None, debug)  # init the parent with no UART
         self._i2c = i2c_device.I2CDevice(i2c_bus, address)
         self._lastbyte = None
-        self._charbuff = bytearray(1)
-        self._internalbuffer = []
+        self._chunk = bytearray(chunk_size)
+        self._pending = bytearray()
         self._timeout = timeout
+
+    def _fill(self) -> int:
+        """Read one chunk from the module into the pending buffer.
+
+        The GTop I2C protocol has no way to report how much data is waiting: the
+        module returns 0x0A filler bytes when it has nothing to send. Those are
+        discarded here, so a return value of 0 means the module is idle and there
+        is no point asking again until more time has passed.
+
+        Returns the number of real bytes recovered.
+        """
+        with self._i2c as i2c:
+            i2c.readinto(self._chunk)
+        recovered = 0
+        for char in self._chunk:
+            if char == 0x0A and self._lastbyte != 0x0D:
+                continue  # filler LF (a real LF only ever follows a CR)
+            self._pending.append(char)
+            self._lastbyte = char  # last approved byte, for CR/LF across chunks
+            recovered += 1
+        return recovered
+
+    def _newline_index(self) -> int:
+        """Index of the first 0x0A in the pending buffer, or -1.
+
+        Written as an explicit scan rather than bytearray.find() so it does not
+        depend on which string methods a given CircuitPython build provides.
+        """
+        for index, char in enumerate(self._pending):
+            if char == 0x0A:
+                return index
+        return -1
+
+    def _resync(self) -> None:
+        """Discard the pending buffer after a lost terminator so it cannot grow
+        without bound.  Clearing ``_lastbyte`` prevents a stale CR from wrongly
+        preserving the next filler LF."""
+        self._pending = bytearray()
+
+        self._lastbyte = None
 
     def read(self, num_bytes: int = 1) -> bytearray:
         """Read up to num_bytes of data from the GPS directly, without parsing.
-        Returns a bytearray with up to num_bytes or None if nothing was read"""
-        result = []
-        for _ in range(num_bytes):
-            with self._i2c as i2c:
-                # we read one byte at a time, verify it isnt part of a string of
-                # 'stuffed' newlines and then append to our result array for byteification
-                i2c.readinto(self._charbuff)
-                char = self._charbuff[0]
-                if (char == 0x0A) and (self._lastbyte != 0x0D):
-                    continue  # skip duplicate \n's!
-                result.append(char)
-                self._lastbyte = char  # keep track of the last character approved
-        return bytearray(result)
+        Returns a bytearray with up to num_bytes, which may be empty if the
+        module had nothing to send or the timeout expired."""
+        deadline = time.monotonic() + self._timeout
+        while len(self._pending) < num_bytes:
+            if self._fill() == 0:
+                break  # module is idle; return what we have
+            if time.monotonic() > deadline:
+                break
+        result = self._pending[:num_bytes]
+        self._pending = self._pending[num_bytes:]
+        return result
 
     def write(self, bytestr: ReadableBuffer) -> None:
         """Write a bytestring data to the GPS directly, without parsing
@@ -852,26 +898,37 @@ class GPS_GtopI2C(GPS):
             i2c.write(bytestr)
 
     @property
-    def in_waiting(self) -> Literal[16]:
-        """Returns number of bytes available in UART read buffer, always 16
-        since I2C does not have the ability to know how much data is available"""
-        return 16
+    def in_waiting(self) -> int:
+        """Number of recovered bytes not yet consumed.
+
+        I2C cannot report a UART-style buffer level, so this pulls a chunk when
+        the pending buffer is below the threshold ``_read_sentence()`` needs
+        before it will attempt a ``readline()``.
+        """
+        while len(self._pending) < _GPSI2C_MIN_PACKET:
+            if self._fill() == 0:
+                break  # module idle; report what we actually have
+        return len(self._pending)
 
     def readline(self) -> Optional[bytearray]:
-        """Returns a newline terminated bytearray, must have timeout set for
-        the underlying UART or this will block forever!"""
-        timeout = time.monotonic() + self._timeout
-        while timeout > time.monotonic():
-            # check if our internal buffer has a '\n' termination already
-            if self._internalbuffer and (self._internalbuffer[-1] == 0x0A):
-                break
-            char = self.read(1)
-            if not char:
-                continue
-            self._internalbuffer.append(char[0])
-            # print(bytearray(self._internalbuffer))
-        if self._internalbuffer and self._internalbuffer[-1] == 0x0A:
-            ret = bytearray(self._internalbuffer)
-            self._internalbuffer = []  # reset the buffer to empty
-            return ret
-        return None  # no completed data yet
+        """Return a newline-terminated bytearray, or None if no complete
+        sentence is available yet.
+
+        Returns as soon as the module reports idle rather than spinning until
+        the timeout expires.  A partial sentence is retained and completed on a
+        later call; a partial that grows past a legal NMEA length is discarded
+        as a lost terminator.
+        """
+        deadline = time.monotonic() + self._timeout
+        while True:
+            newline = self._newline_index()
+            if newline >= 0:
+                line = self._pending[: newline + 1]
+                self._pending = self._pending[newline + 1 :]
+                return line
+            if len(self._pending) > _GPSI2C_MAX_PENDING:
+                self._resync()  # unterminated and over-long => garbage
+            if self._fill() == 0:
+                return None  # module idle; no completed sentence yet
+            if time.monotonic() > deadline:
+                return None
