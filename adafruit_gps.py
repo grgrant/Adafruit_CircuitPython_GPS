@@ -888,7 +888,7 @@ class GPS_GtopI2C(GPS):
             if time.monotonic() > deadline:
                 break
         result = self._pending[:num_bytes]
-        self._pending = self._pending[num_bytes:]
+        self._pending[:num_bytes] = b""  # in-place shrink
         return result
 
     def write(self, bytestr: ReadableBuffer) -> None:
@@ -924,7 +924,7 @@ class GPS_GtopI2C(GPS):
             newline = self._newline_index()
             if newline >= 0:
                 line = self._pending[: newline + 1]
-                self._pending = self._pending[newline + 1 :]
+                self._pending[: newline + 1] = b""  # in-place shrink
                 return line
             if len(self._pending) > _GPSI2C_MAX_PENDING:
                 self._resync()  # unterminated and over-long => garbage
